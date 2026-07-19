@@ -34,7 +34,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python predictive_maintenance_project/model_building/preparation.py
 
-
   model-training:
     needs: data-prep
     runs-on: ubuntu-latest
@@ -42,36 +41,13 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Dependencies
         run: pip install -r predictive_maintenance_project/requirements.txt
-      - name: Launch MLflow server on port 5000
-        run: |
-          mkdir -p ${{ env.ARTIFACT_STORE }}
-          nohup mlflow server \
-            --host 127.0.0.1 \
-            --port 5000 \
-            --backend-store-uri sqlite:///mlflow.db \
-            --default-artifact-root ${{ env.ARTIFACT_STORE }} \
-            > mlflow.log 2>&1 &
-      - name: Wait until MLflow is healthy
-        run: |
-          timeout 60 bash -c \
-            'until curl -sf http://127.0.0.1:5000/health; do sleep 2; done'
-          echo "MLflow server is ready."
-      - name: Model Building
+      - name: Model Building & Remote Logging
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+          DAGSHUB_USER_TOKEN: ${{ secrets.DAGSHUB_TOKEN }} 
         run: |
           cd predictive_maintenance_project/model_building
           python train.py
-      - name: Archive MLflow experiment data
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: mlflow-experiment-data
-          path: |
-            mlflow.db
-            ${{ env.ARTIFACT_STORE }}
-          retention-days: 30
 
   deploy-hosting:
     runs-on: ubuntu-latest
