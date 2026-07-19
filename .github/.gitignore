@@ -1,8 +1,0 @@
-mlruns/
-*.joblib
-*.pkl
-*.pickle
-__pycache__/
-.env
-*.pyc
-predictive_maintenance_project/data/*.csv
