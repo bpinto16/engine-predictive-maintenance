@@ -1,4 +1,3 @@
-```
 name: Engine Predictor Maintenance Pipeline
 
 on:
@@ -83,6 +82,3 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python hosting/hosting.py
-
-
-```
