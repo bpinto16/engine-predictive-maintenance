@@ -65,7 +65,7 @@ jobs:
           python train.py
       - name: Archive MLflow experiment data
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: mlflow-experiment-data
           path: |
