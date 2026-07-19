@@ -39,7 +39,7 @@ jobs:
     needs: data-prep
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Dependencies
         run: pip install -r predictive_maintenance_project/requirements.txt
       - name: Launch MLflow server on port 5000
@@ -65,7 +65,7 @@ jobs:
           python train.py
       - name: Archive MLflow experiment data
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: mlflow-experiment-data
           path: |
