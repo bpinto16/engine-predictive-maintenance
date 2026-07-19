@@ -60,7 +60,9 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MLFLOW_TRACKING_URI: http://127.0.0.1:5000
-        run: MLFLOW_TRACKING_URI=http://127.0.0.1:5000 python predictive_maintenance_project/model_building/train.py
+        run: |
+          cd predictive_maintenance_project/model_building
+          python train.py
       - name: Archive MLflow experiment data
         if: always()
         uses: actions/upload-artifact@v5
