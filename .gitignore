@@ -5,4 +5,4 @@ mlruns/
 __pycache__/
 .env
 *.pyc
-predictive_maintenance_project/data/*.csv
+
