@@ -1,0 +1,39 @@
+
+{
+  "Engine rpm": {
+    "physical_min": 0.0,
+    "physical_max": 3000.0,
+    "operating_min": 382.0,
+    "operating_max": 1565.0
+  },
+  "Lub oil pressure": {
+    "physical_min": 0.1,
+    "physical_max": 10.0,
+    "operating_min": 0.858,
+    "operating_max": 5.605
+  },
+  "Fuel pressure": {
+    "physical_min": 0.1,
+    "physical_max": 25.0,
+    "operating_min": 1.396,
+    "operating_max": 16.161
+  },
+  "Coolant pressure": {
+    "physical_min": 0.1,
+    "physical_max": 10.0,
+    "operating_min": 0.723,
+    "operating_max": 5.95
+  },
+  "lub oil temp": {
+    "physical_min": 40.0,
+    "physical_max": 130.0,
+    "operating_min": 73.413,
+    "operating_max": 87.35
+  },
+  "Coolant temp": {
+    "physical_min": 40.0,
+    "physical_max": 120.0,
+    "operating_min": 65.74,
+    "operating_max": 91.78
+  }
+}
