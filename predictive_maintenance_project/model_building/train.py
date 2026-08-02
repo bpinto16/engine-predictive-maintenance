@@ -1,0 +1,576 @@
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import joblib
+import numpy as np
+import pandas as pd
+import json
+from datetime import datetime
+from huggingface_hub import HfApi, create_repo
+from huggingface_hub.utils import RepositoryNotFoundError
+
+# for preprocessing and pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, RandomizedSearchCV, cross_val_predict
+
+from sklearn.base import clone                                              
+                            
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_auc_score, average_precision_score,
+    f1_score, precision_score, recall_score, accuracy_score,
+)
+
+import xgboost as xgb
+
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    BaggingClassifier,
+    RandomForestClassifier,
+    AdaBoostClassifier,
+    GradientBoostingClassifier,
+)
+
+# for experiment tracking
+import mlflow
+from mlflow.tracking import MlflowClient
+import dagshub
+import mlflow.sklearn
+
+
+# Constants
+HF_DATASET_REPO  = "bpinto16/Predictive-Maintenance-HFSpace"
+HF_MODEL_REPO    = "bpinto16/predictive-maintenance-mlflow-model"
+MODEL_FILENAME   = "best_predictive_maintenance_mlflow_model.joblib"
+RANDOM_STATE     = 42
+MLFLOW_EXPERIMENT_NAME = "engine-predictive-maintenance-experiment"
+
+
+DAGSHUB_USERNAME = os.getenv("DAGSHUB_USERNAME")
+dagshub.init(repo_owner=DAGSHUB_USERNAME, repo_name="engine-predictive-maintenance", mlflow=True)
+
+
+STAGING_THRESHOLD = 0.35     # diagnostic-only, for the leaderboard
+
+# --- operating-point policy  -------------------
+MIN_FAULT_RECALL  = 0.90 
+MIN_NORMAL_RECALL = 0.13     
+COST_FN           = 12.0      # relative cost of a missed fault
+COST_FP           = 1.0      # relative cost of a false alarm
+THRESHOLD_GRID    = np.arange(0.08, 0.90, 0.01)
+CLASS_WEIGHT = "balanced"
+#CLASS_WEIGHT = {0: 1, 1: 16}  # Normal: 1, Faulty: 16
+
+TARGET_COL   = "Engine Condition"
+NUMERIC_COLS = [
+    "Engine rpm", "Lub oil pressure", "Fuel pressure",
+    "Coolant pressure", "lub oil temp", "Coolant temp",
+    "Pressure Delta", "Temperature Ratio", "Thermal-Mechanical Stress"
+]
+
+
+
+# Hugging Face auth
+api = HfApi(token=os.getenv("HF_TOKEN"))
+
+if os.getenv("MLFLOW_TRACKING_URI"):
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+else:
+    mlflow.set_tracking_uri("http://localhost:5000")
+mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
+
+
+client = MlflowClient(tracking_uri=mlflow.get_tracking_uri())
+
+# Enable automatic logging for hyperparameter tuning structures
+mlflow.sklearn.autolog(disable=True)
+
+# ---------------------------------------------------------------------
+# numpy scalars (np.float64 from
+# sklearn metrics) can silently fail to persist in some MLflow/DagsHub
+# versions, which also produces empty columns. Cast everything explicitly.
+# ---------------------------------------------------------------------
+def log_metrics_clean(d, step=None):
+    clean = {k: float(v) for k, v in d.items() if v is not None}
+    if step is None:
+        mlflow.log_metrics(clean)
+    else:
+        for k, v in clean.items():
+            mlflow.log_metric(k, float(v), step=step)
+ 
+def log_params_clean(d):
+    mlflow.log_params({k: str(v) for k, v in d.items()})
+
+# LOAD PREPROCESSED SPLITS
+print("Load preprocessed splits from Hugging Face")
+BASE = f"hf://datasets/{HF_DATASET_REPO}"
+
+Xtrain = pd.read_csv(f"{BASE}/Xtrain.csv")
+Xtest  = pd.read_csv(f"{BASE}/Xtest.csv")
+ytrain = pd.read_csv(f"{BASE}/ytrain.csv").squeeze("columns")
+ytest  = pd.read_csv(f"{BASE}/ytest.csv").squeeze("columns")
+
+print(f"Xtrain : {Xtrain.shape}   ytrain : {ytrain.shape}")
+print(f"Xtest  : {Xtest.shape}    ytest  : {ytest.shape}")
+
+
+# ---------------------------------------------------------------------
+# Shared leakage-safe preprocessor 
+# ---------------------------------------------------------------------
+preprocessor = ColumnTransformer(
+    transformers=[("scaler", StandardScaler(), NUMERIC_COLS)],
+    remainder="drop",
+    verbose_feature_names_out=False,
+)
+
+# ---------------------------------------------------------------------
+# Target is ~63% faulty / 37% normal -> weight the minority (normal=0)
+# ---------------------------------------------------------------------
+print("Compute class imbalance weight")
+scale_pos_weight = float(ytrain.value_counts()[0] / ytrain.value_counts()[1])
+#scale_pos_weight = COST_FN / COST_FP
+
+
+def build_pipeline(model):
+    """scaler (per-fold) -> model. Leakage-safe: the scaler is fit inside each CV fold."""
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("model", model),
+    ])
+ 
+# ---------------------------------------------------------------------
+# Define candidate models + parameter grids
+# ---------------------------------------------------------------------
+candidates = {
+    "DecisionTree": (
+        DecisionTreeClassifier(class_weight=CLASS_WEIGHT, random_state=RANDOM_STATE),
+        {
+            "model__max_depth":        [3, 5, 7, None],
+            "model__min_samples_leaf": [1, 5, 20],
+            "model__criterion":        ["gini", "entropy"],
+        },
+    ),
+    "Bagging": (
+        BaggingClassifier(estimator=DecisionTreeClassifier(max_depth=8),random_state=RANDOM_STATE, n_jobs=1),
+        {
+            "model__n_estimators":  [50, 100],
+            "model__max_samples":   [0.7, 1.0],
+            "model__max_features":  [0.7, 1.0],
+        },
+    ),
+    "RandomForest": (
+        RandomForestClassifier(class_weight=CLASS_WEIGHT, random_state=RANDOM_STATE, n_jobs=1),
+        {
+            "model__n_estimators":     [150, 200, 100],
+            "model__max_depth":        [10, 15, None],
+            "model__min_samples_leaf": [2, 4],
+            "model__min_samples_split":[2,5,10],
+            "model__max_features":     ["sqrt",0.6,0.8]
+        },
+    ),
+    "AdaBoost": (
+        AdaBoostClassifier(random_state=RANDOM_STATE),
+        {
+            "model__n_estimators":  [150, 200],
+            "model__learning_rate": [1.0],
+        },
+    ),
+    "GradientBoosting": (
+        GradientBoostingClassifier(random_state=RANDOM_STATE),
+        {
+            "model__n_estimators":  [150, 200],
+            "model__max_depth":     [ 3, 4,],
+            "model__learning_rate": [0.01, 0.07],
+            "model__subsample":     [0.6, 0.8],
+            "model__min_samples_leaf":[1,3,5]
+        },
+    ),
+    "XGBoost": (
+        xgb.XGBClassifier(
+            random_state=RANDOM_STATE,
+            eval_metric="logloss", verbosity=0,
+            scale_pos_weight=scale_pos_weight,
+        ),
+        {
+            "model__n_estimators":     [200, 220],
+            "model__max_depth":        [3, 5],
+            "model__learning_rate":    [ 0.05, 0.08],
+            "model__gamma":            [0,0.3],
+            "model__min_child_weight": [5],
+            "model__subsample":        [0.7, 0.8, 1.0],
+            "model__colsample_bytree": [0.8, 1.0],
+            "model__reg_alpha":        [0,0.1,1],
+            "model__reg_lambda":       [1]
+        },
+    ),
+}
+
+ 
+cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+SEARCH_CV = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)  # 3-fold during search (faster)
+MAX_GRID_COMBOS = 50   # grids larger than this use RandomizedSearchCV
+N_ITER_RANDOM   = 40   # sampled combos when randomized
+ 
+# representative input row for the model signature
+input_example = pd.DataFrame([{c: float(Xtrain[c].median()) for c in Xtrain.columns}])
+ 
+PRIMARY_METRIC = "pr_auc"               
+ 
+SCORING = {                              # multi-metric CV scoring
+    "pr_auc":  "average_precision",
+    "roc_auc": "roc_auc",
+    "recall":  "recall",
+}
+
+def make_search(model, grid):                                        
+    """GridSearchCV for small grids, RandomizedSearchCV for large ones."""
+    n_combos = 1
+    for v in grid.values():
+        n_combos *= len(v)
+
+    common = dict(
+        cv=SEARCH_CV,                 # 3-fold search
+        scoring=SCORING,
+        refit=PRIMARY_METRIC,
+        n_jobs=-1,                    # search owns the parallelism
+        verbose=0,
+        return_train_score=True,
+    )
+    if n_combos > MAX_GRID_COMBOS:
+        n_iter = min(N_ITER_RANDOM, n_combos)
+        print(f"  {n_combos} combos > {MAX_GRID_COMBOS} → RandomizedSearchCV (n_iter={n_iter})")
+        return RandomizedSearchCV(
+            estimator=build_pipeline(model),
+            param_distributions=grid,
+            n_iter=n_iter,
+            random_state=RANDOM_STATE,
+            **common,
+        )
+        
+    print(f"  {n_combos} combos ≤ {MAX_GRID_COMBOS} → GridSearchCV (exhaustive)")
+    return GridSearchCV(
+        estimator=build_pipeline(model),
+        param_grid=grid,
+        **common,
+    )
+
+
+def evaluate_threshold(y_true, proba, t):
+    """Full metric set at one threshold, including BOTH classes' recall."""
+    pred = (proba >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    return {
+        "threshold":        round(float(t), 3),
+        "faulty_recall":    recall_score(y_true, pred, pos_label=1, zero_division=0),
+        "normal_recall":    recall_score(y_true, pred, pos_label=0, zero_division=0),
+        "faulty_precision": precision_score(y_true, pred, pos_label=1, zero_division=0),
+        "faulty_f1":        f1_score(y_true, pred, pos_label=1, zero_division=0),
+        "false_negatives":  int(fn),
+        "false_positives":  int(fp),
+        "total_cost":       float(COST_FN * fn + COST_FP * fp),
+    }
+
+
+def select_threshold(y_true, proba, min_fault_recall=MIN_FAULT_RECALL, min_normal_recall=MIN_NORMAL_RECALL, grid=THRESHOLD_GRID):
+    """Constraint-first, cost-second: cheapest threshold that still keeps
+    Normal-class recall above the floor (prevents the 'predict-faulty-for-all'
+    degenerate regime). Falls back to max-Normal-recall with a warning."""
+    rows = [evaluate_threshold(y_true, proba, t) for t in grid]
+    feasible = [
+        r for r in rows
+        if (
+            r["faulty_recall"] >= min_fault_recall
+            and r["normal_recall"] >= min_normal_recall
+        )
+    ]
+    
+    if feasible:
+        best = min(feasible, key=lambda r: r["total_cost"])
+        best["selection_note"] = f"min-cost within constraints"
+    else:
+        # Fallback: Ignore constraints
+        best = max(rows, key=lambda r: r["normal_recall"])
+        best["selection_note"] = f"WARNING: constraints unmet; defaulting to absolute min-cost threshold"
+        
+    return best, rows
+
+# ---------------------------------------------------------------------
+# Tune each model, log to MLflow, track the best
+# ---------------------------------------------------------------------
+
+print("\n-- MLflow tracking --")
+leaderboard = []
+best_overall = {"name": None, "cv_pr_auc": -np.inf, "estimator": None, "params": None,
+                 "feasible": False, "oof_cost": np.inf}
+
+# Start the Parent Run (represents the whole pipeline execution)
+parent_name = f"engine_maintenance_model_selection_{datetime.now().strftime('%Y%m%d-%H%M')}"
+ 
+with mlflow.start_run(run_name=parent_name) as parent_run:
+    mlflow.set_tags({
+        "pipeline_step":            "train",
+        "dataset":                  HF_DATASET_REPO,
+        "primary_metric":           PRIMARY_METRIC,          
+        "staging_threshold":        str(STAGING_THRESHOLD),
+        "training_date":            datetime.now().strftime("%Y-%m-%d"),
+        "data_version":             "v1",
+        "models_compared":          ", ".join(candidates.keys()),
+    })
+ 
+    for name, (model, grid) in candidates.items():
+        print(f"\n{'='*60}\nTuning {name}\n{'='*60}")
+        with mlflow.start_run(run_name=name, nested=True):
+            # Tag every child so DagsHub run search can filter:
+            # tags.model_family = "GradientBoosting", etc.
+            mlflow.set_tags({"model_family": name, "pipeline_step": "tune"})
+ 
+            gs = make_search(model, grid)  # (auto Grid vs Randomized, 3-fold search)
+            gs.fit(Xtrain, ytrain)
+
+            mlflow.set_tag("search_type", type(gs).__name__)   # logs "GridSearchCV" or "RandomizedSearchCV"
+            mlflow.log_param("search_cv_folds", SEARCH_CV.get_n_splits())  
+ 
+            # ---- CV metrics at the winning param combo ----
+            bi = gs.best_index_
+            cv_metrics = {
+                f"cv_{m}": float(gs.cv_results_[f"mean_test_{m}"][bi])
+                for m in SCORING
+            }
+            cv_metrics["cv_pr_auc_std"] = float(gs.cv_results_["std_test_pr_auc"][bi])
+ 
+            # ---- Held-out test metrics at the operating threshold ----
+            proba_te = gs.best_estimator_.predict_proba(Xtest)[:, 1]
+            pred_te  = (proba_te >= STAGING_THRESHOLD).astype(int)
+            test_metrics = {
+                "test_pr_auc":              float(average_precision_score(ytest, proba_te)),
+                "test_roc_auc":             float(roc_auc_score(ytest, proba_te)),
+                "test_recall_at0p5":        float(recall_score(ytest, pred_te)),
+                "test_normal_recall_at0p5": float(recall_score(ytest, pred_te, pos_label=0, zero_division=0)),
+                "test_precision_at0p5":     float(precision_score(ytest, pred_te, zero_division=0)),
+                "test_f1_at0p5":            float(f1_score(ytest, pred_te)),
+                "test_accuracy_at0p5":      float(accuracy_score(ytest, pred_te)),
+            }
+
+            leaderboard.append({"model": name, **cv_metrics, **test_metrics})
+
+            # ---- Feasibility + cost, computed LEAKAGE-SAFE on OOF train ----
+            oof_proba = cross_val_predict(
+                clone(gs.best_estimator_), Xtrain, ytrain,
+                cv=cv_strategy, method="predict_proba", n_jobs=-1,
+            )[:, 1]
+            best_t_model, sweep_check = select_threshold(ytrain, oof_proba)
+            is_feasible = any(
+                (
+                    r["faulty_recall"] >= MIN_FAULT_RECALL and
+                    r["normal_recall"] >= MIN_NORMAL_RECALL
+                )
+                for r in sweep_check
+            )
+            model_cost  = best_t_model["total_cost"]
+            model_recall = best_t_model["faulty_recall"]
+
+            mlflow.set_tag("feasible", str(is_feasible))
+            mlflow.log_metric("oof_total_cost", float(model_cost))
+            mlflow.log_metric("oof_faulty_recall", float(model_recall))
+            print(f"  Feasible (OOF, Normal-recall >= {MIN_NORMAL_RECALL:.0%}): {is_feasible}   "
+                  f"OOF cost={model_cost:.0f}  OOF faulty recall={model_recall:.3f}")
+ 
+            # ---- Log params + metrics (consistent names across runs) ----
+            mlflow.log_params(gs.best_params_)
+            mlflow.log_param("staging_threshold", STAGING_THRESHOLD)
+            mlflow.log_param("cv_n_splits", SEARCH_CV.get_n_splits())
+            mlflow.log_metrics({**cv_metrics,
+                                **{k: float(v) for k, v in test_metrics.items()}})
+ 
+            # ---- threshold sweep as stepped metrics (renders as
+            #      a curve in DagsHub; x-axis = threshold * 100) ----
+            for t in np.arange(0.30, 0.61, 0.02):
+                p = (proba_te >= t).astype(int)
+                step = int(round(t * 100))
+                mlflow.log_metric("sweep_recall",    recall_score(ytest, p), step=step)
+                mlflow.log_metric("sweep_precision", precision_score(ytest, p, zero_division=0), step=step)
+                mlflow.log_metric("sweep_f1",        f1_score(ytest, p), step=step)
+ 
+            # ---- full grid results as an auditable artifact ----
+            cv_df = pd.DataFrame(gs.cv_results_)
+            cv_path = f"cv_results_{name}.csv"
+            cv_df.to_csv(cv_path, index=False)
+            mlflow.log_artifact(cv_path)
+ 
+            for k, v in {
+                f"mdl__{name}__cv_pr_auc":    cv_metrics["cv_pr_auc"],
+                f"mdl__{name}__test_pr_auc":  test_metrics["test_pr_auc"],
+                f"mdl__{name}__test_roc_auc": test_metrics["test_roc_auc"],
+            }.items():
+                client.log_metric(parent_run.info.run_id, k, float(v))
+ 
+            print(f"  Best CV PR-AUC : {cv_metrics['cv_pr_auc']:.4f} "
+                  f"(± {cv_metrics['cv_pr_auc_std']:.4f})")
+            print(f"  Test PR-AUC    : {test_metrics['test_pr_auc']:.4f}   "
+                  f"Test Recall@0.5: {test_metrics['test_recall_at0p5']:.4f}")
+ 
+                
+            # ---- select champion: feasible models first, then LOWEST COST
+            # among the feasible tier -- not cv_pr_auc. PR-AUC differences
+            # between candidates are frequently within CV noise (e.g. 0.0004
+            # vs a std of ~0.005) while cost/recall differences are large and
+            # directly reflect the stated business objective (catch faults).
+            should_replace = (
+                (is_feasible and not best_overall["feasible"]) or # any feasible beats any infeasible
+                (is_feasible == best_overall["feasible"] and
+                 model_cost < best_overall.get("oof_cost", np.inf)) # else lowest OOF cost wins
+            )
+            if should_replace:
+                best_overall.update(name=name,
+                                    cv_pr_auc=cv_metrics["cv_pr_auc"],
+                                    estimator=gs.best_estimator_,
+                                    params=gs.best_params_,
+                                    feasible=is_feasible,
+                                    oof_cost=model_cost)
+
+ 
+    # -----------------------------------------------------------------
+    # 5. Leaderboard + full evaluation of the winning model
+    # -----------------------------------------------------------------
+    lb = pd.DataFrame(leaderboard).sort_values("test_pr_auc", ascending=False)
+    lb.to_csv("model_leaderboard.csv", index=False)
+    mlflow.log_artifact("model_leaderboard.csv")
+    print("\n===== LEADERBOARD (sorted by test PR-AUC) =====")
+    print(lb.round(4).to_string(index=False))
+
+    if not best_overall["feasible"]:
+        print(f"\nWARNING: no candidate model can reach Normal-recall >= "
+              f"{MIN_NORMAL_RECALL:.0%} at any threshold. Shipping the least-"
+              f"bad option ({best_overall['name']}); consider lowering "
+              f"MIN_NORMAL_RECALL or revisiting the training weights.")  
+ 
+    best_pipeline = best_overall["estimator"]
+    # metric selected on (PR-AUC).
+    print(f"\nBEST MODEL: {best_overall['name']}  "
+          f"(feasible={best_overall['feasible']}, "
+          f"OOF cost={best_overall['oof_cost']:.0f}, "
+          f"CV PR-AUC={best_overall['cv_pr_auc']:.4f} for reference)")
+    
+
+    print(f"\nNote: leaderboard columns are measured at the STAGING threshold "
+          f"({STAGING_THRESHOLD}); the champion is DEPLOYED at a threshold chosen "
+          f"by the cost/recall constraint below, so its final metrics will differ "
+          f"from its leaderboard row.")
+    
+    # tag + best-param logging happens ONCE here
+    mlflow.set_tag("best_model", best_overall["name"])
+    mlflow.log_params({f"best__{k}": v for k, v in best_overall["params"].items()})
+ 
+    oof_proba_train = cross_val_predict(
+        clone(best_pipeline), Xtrain, ytrain,
+        cv=cv_strategy, method="predict_proba", n_jobs=-1,
+    )[:, 1]
+    best_t, sweep_rows = select_threshold(ytrain, oof_proba_train)
+    DEPLOY_THRESHOLD = best_t["threshold"]
+ 
+    print(f"\nSelected deploy threshold (on OOF train): {DEPLOY_THRESHOLD}  ({best_t['selection_note']})")
+    print(f"  [OOF] Faulty recall : {best_t['faulty_recall']:.3f}")
+    print(f"  [OOF] Normal recall : {best_t['normal_recall']:.3f}")
+    print(f"  [OOF] Faulty prec   : {best_t['faulty_precision']:.3f}")
+    print(f"  [OOF] FN / FP       : {best_t['false_negatives']} / {best_t['false_positives']}")
+ 
+    pd.DataFrame(sweep_rows).to_csv("threshold_sweep.csv", index=False)
+    mlflow.log_artifact("threshold_sweep.csv")
+    mlflow.log_param("deploy_threshold", DEPLOY_THRESHOLD)
+    mlflow.log_param("min_normal_recall_constraint", MIN_NORMAL_RECALL)
+    mlflow.log_param("min_fault_recall_constraint", MIN_FAULT_RECALL)
+    mlflow.log_param("cost_ratio_fn_fp", f"{COST_FN:g}:{COST_FP:g}")
+
+    proba_train = best_pipeline.predict_proba(Xtrain)[:, 1]
+    proba_test  = best_pipeline.predict_proba(Xtest)[:, 1]
+    y_pred_train = (proba_train >= DEPLOY_THRESHOLD).astype(int)
+    y_pred_test  = (proba_test  >= DEPLOY_THRESHOLD).astype(int)
+ 
+    train_roc = roc_auc_score(ytrain, proba_train)
+    test_roc  = roc_auc_score(ytest,  proba_test)
+    train_pr  = average_precision_score(ytrain, proba_train)
+    test_pr   = average_precision_score(ytest,  proba_test)
+    overfit_gap_roc = train_roc - test_roc
+    overfit_gap_pr  = train_pr - test_pr
+ 
+    log_metrics_clean({
+        "final_train_roc_auc":  train_roc,
+        "final_test_roc_auc":   test_roc,
+        "final_train_pr_auc":   train_pr,
+        "final_test_pr_auc":    test_pr,
+        "final_test_f1":        f1_score(ytest, y_pred_test),
+        "final_test_recall":    recall_score(ytest, y_pred_test),
+        "final_test_normal_recall": recall_score(ytest, y_pred_test, pos_label=0, zero_division=0),
+        "final_test_precision": precision_score(ytest, y_pred_test, zero_division=0),
+        "final_deploy_threshold": DEPLOY_THRESHOLD,
+        "overfit_gap_roc":      overfit_gap_roc,
+        "overfit_gap_pr":       overfit_gap_pr,
+    })
+ 
+    print("\n-- Final evaluation (winning model, at deploy threshold on TEST) --")
+    print("Test set classification report:")
+    print(classification_report(ytest, y_pred_test, target_names=["Normal", "Faulty"]))
+    print("Confusion matrix [rows=true, cols=pred]:")
+    print(confusion_matrix(ytest, y_pred_test))
+    print(f"\nTrain PR-AUC : {train_pr:.4f}   Test PR-AUC : {test_pr:.4f}")
+    print(f"Train ROC-AUC: {train_roc:.4f}   Test ROC-AUC: {test_roc:.4f}")
+    print(f"Overfit gap (PR): {overfit_gap_pr:.4f}  "
+          f"({'acceptable' if overfit_gap_pr < 0.05 else 'WARNING: possible overfit'})")
+    
+
+ 
+
+    # Register the best model in the MLflow registry
+    mlflow.sklearn.log_model(
+        sk_model=best_pipeline,
+        name="engine_maintenance_pipeline",
+        registered_model_name="EnginePredictiveMaintenanceClassifier",
+        input_example=input_example,
+    )
+    print(f"\nMLflow parent run ID: {parent_run.info.run_id}")
+ 
+# ---------------------------------------------------------------------
+# 7. Register the best model in the Hugging Face MODEL hub
+# ---------------------------------------------------------------------
+print("\n-- Save & upload best model to HF Model Hub --")
+joblib.dump(best_pipeline, MODEL_FILENAME)
+ 
+# also ship the metadata card so the deployment app knows what it loaded
+metadata = {
+    "best_model":               best_overall["name"],
+    "best_params":              {k: str(v) for k, v in best_overall["params"].items()},
+    "selection_feasible":       bool(best_overall["feasible"]),
+    "selection_oof_cost":       float(best_overall["oof_cost"]),  
+    "classification_threshold": DEPLOY_THRESHOLD,          # app.py reads THIS
+    "min_fault_recall":         MIN_FAULT_RECALL,
+    "min_normal_recall":        MIN_NORMAL_RECALL,
+    "cost_ratio_fn_fp":         f"{COST_FN:g}:{COST_FP:g}",
+    "primary_metric":           PRIMARY_METRIC,
+    "cv_pr_auc":                float(best_overall["cv_pr_auc"]),
+    "test_pr_auc":              float(test_pr),
+    "test_roc_auc":             float(test_roc),
+    "test_recall_at_threshold": float(recall_score(ytest, y_pred_test)),
+    "test_normal_recall_at_threshold": float(recall_score(ytest, y_pred_test, pos_label=0, zero_division=0)),
+    "feature_order":            list(Xtrain.columns),
+    "trained_on":               datetime.now().strftime("%Y-%m-%d"),
+}
+with open("model_metadata.json", "w") as f:
+    json.dump(metadata, f, indent=2)
+ 
+try:
+    api.repo_info(repo_id=HF_MODEL_REPO, repo_type="model")
+except RepositoryNotFoundError:
+    create_repo(repo_id=HF_MODEL_REPO, repo_type="model", private=False, token=os.getenv("HF_TOKEN"))
+ 
+for fname in [MODEL_FILENAME, "model_metadata.json", "model_leaderboard.csv"]:
+    api.upload_file(path_or_fileobj=fname, path_in_repo=fname,
+                    repo_id=HF_MODEL_REPO, repo_type="model")
+    print(f"  Uploaded: {fname} to {HF_MODEL_REPO}")
+ 
+print("\ntrain.py completed successfully.")
